@@ -217,9 +217,106 @@ class FortiManagerClient:
         FMG 7.6+: /pm/config/adom/{adom}/obj/fmg/script
         FMG 7.0-7.4: /dvmdb/adom/{adom}/script
         """
-        if self._fmg_version and self._fmg_version >= (7, 6, 0):
+        if self._uses_new_script_endpoint():
             return f"/pm/config/adom/{adom}/obj/fmg/script"
         return f"/dvmdb/adom/{adom}/script"
+
+    def _uses_new_script_endpoint(self) -> bool:
+        """Whether the FMG 7.6+ /pm/config script endpoint is in use.
+
+        Used as the branch condition for the script target string<->int mapping.
+        Must mirror the version check in :meth:`_script_base_url`.
+        """
+        return self._fmg_version is not None and self._fmg_version >= (7, 6, 0)
+
+    # Script target mapping for FMG 7.6+ /pm/config endpoint.
+    #
+    # The legacy /dvmdb endpoint accepts string targets verbatim. The new
+    # /pm/config endpoint expects integers and silently coerces unknown values
+    # (including strings) to 0 (device_database). See GitHub issue #3.
+    #
+    # Mapping source: FMG API doc 012_cli_script_management.rst
+    #   - device_database -> 0 (confirmed, doc line 1649)
+    #   - adom_database   -> 1 (confirmed, doc lines 1580/1603/1626)
+    #   - remote_device   -> 2 (confirmed live against FMG 7.6.6:
+    #                           create_script + get_script round-trip)
+    _SCRIPT_TARGET_MAP: dict[str, int] = {
+        "device_database": 0,
+        "adom_database": 1,
+        "remote_device": 2,
+    }
+    _SCRIPT_TARGET_REVERSE: dict[int, str] = {
+        0: "device_database",
+        1: "adom_database",
+        2: "remote_device",
+    }
+
+    def _map_script_target(self, script: dict[str, Any]) -> dict[str, Any]:
+        """Map string `target` to int for the FMG 7.6+ script endpoint.
+
+        No-op for the legacy /dvmdb endpoint (which accepts strings) and for
+        scripts whose target is already an int or absent. Unknown string
+        values are passed through unchanged so the API surface still
+        reports an error rather than silently rewriting to 0.
+        """
+        target = script.get("target")
+        if not isinstance(target, str):
+            return script
+        if not self._uses_new_script_endpoint():
+            return script
+        if target not in self._SCRIPT_TARGET_MAP:
+            return script
+        mapped = dict(script)
+        mapped["target"] = self._SCRIPT_TARGET_MAP[target]
+        return mapped
+
+    def _unmap_script_target(self, script: Any) -> Any:
+        """Map int `target` back to string for the FMG 7.6+ script endpoint.
+
+        Keeps the public API surface string-typed for callers. No-op for
+        legacy endpoint responses (already strings), non-dict inputs, and
+        unknown integer values.
+        """
+        if not isinstance(script, dict):
+            return script
+        target = script.get("target")
+        if not isinstance(target, int) or isinstance(target, bool):
+            return script
+        if target not in self._SCRIPT_TARGET_REVERSE:
+            return script
+        unmapped = dict(script)
+        unmapped["target"] = self._SCRIPT_TARGET_REVERSE[target]
+        return unmapped
+
+    def _map_script_target_filter(self, filter_expr: Any) -> Any:
+        """Translate string `target` values in a filter expression to ints
+        for the FMG 7.6+ script endpoint.
+
+        FMG 7.6+ stores `target` as an integer, so a filter like
+        `["target", "==", "remote_device"]` never matches and (worse) FMG
+        silently coerces the unknown string to 0, returning the wrong rows.
+        This walks the expression and replaces any 3-element triplet
+        `["target", <op>, <known string>]` with its integer counterpart.
+
+        No-op on the legacy /dvmdb endpoint (which stores strings), for
+        non-list inputs, and for unknown target string values (left for
+        FMG to surface explicitly).
+        """
+        if not self._uses_new_script_endpoint():
+            return filter_expr
+        return self._walk_script_target_filter(filter_expr)
+
+    def _walk_script_target_filter(self, expr: Any) -> Any:
+        if not isinstance(expr, list):
+            return expr
+        if (
+            len(expr) == 3
+            and expr[0] == "target"
+            and isinstance(expr[2], str)
+            and expr[2] in self._SCRIPT_TARGET_MAP
+        ):
+            return [expr[0], expr[1], self._SCRIPT_TARGET_MAP[expr[2]]]
+        return [self._walk_script_target_filter(item) for item in expr]
 
     def _ensure_connected(self) -> FortiManager:
         """Ensure client is connected and return pyfmg instance."""
@@ -1233,10 +1330,18 @@ class FortiManagerClient:
         if fields:
             params["fields"] = fields
         if filter:
-            params["filter"] = filter
+            params["filter"] = self._map_script_target_filter(filter)
 
         result = await self.get(self._script_base_url(adom), **params)
-        return result if isinstance(result, list) else [result] if result else []
+        if isinstance(result, list):
+            scripts = result
+        elif result:
+            scripts = [result]
+        else:
+            scripts = []
+        # Reverse-map int targets to strings so the public API stays
+        # string-typed regardless of the underlying endpoint version.
+        return [self._unmap_script_target(s) for s in scripts]
 
     async def get_script(
         self,
@@ -1248,7 +1353,8 @@ class FortiManagerClient:
         Uses version-aware endpoint (see list_scripts).
         """
         await self._detect_version()
-        return await self.get(f"{self._script_base_url(adom)}/{name}")
+        result = await self.get(f"{self._script_base_url(adom)}/{name}")
+        return self._unmap_script_target(result)
 
     async def create_script(
         self,
@@ -1267,6 +1373,7 @@ class FortiManagerClient:
             - desc: Description
         """
         await self._detect_version()
+        script = self._map_script_target(script)
         return await self.add(self._script_base_url(adom), data=script)
 
     async def update_script(
@@ -1280,6 +1387,7 @@ class FortiManagerClient:
         Uses version-aware endpoint (see list_scripts).
         """
         await self._detect_version()
+        data = self._map_script_target(data)
         return await self.update(f"{self._script_base_url(adom)}/{name}", data=data)
 
     async def delete_script(
