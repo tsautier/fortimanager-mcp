@@ -3,6 +3,7 @@
 Based on FNDN FortiManager 7.6.5 API specifications.
 """
 
+import asyncio
 import logging
 from typing import Any
 
@@ -61,6 +62,13 @@ class FortiManagerClient:
     Based on FNDN FortiManager 7.6.5 specifications.
     """
 
+    # FMG error codes that mean the server session is gone (revive once).
+    # -2 invalid session / -20 invalid credentials / -21 token expired.
+    _RECONNECTABLE_ERROR_CODES = frozenset({-2, -20, -21})
+    # FMG error codes worth a bounded transient retry.
+    # -1 internal error / -11 task timeout.
+    _TRANSIENT_ERROR_CODES = frozenset({-1, -11})
+
     def __init__(
         self,
         host: str,
@@ -82,7 +90,17 @@ class FortiManagerClient:
 
         self._fmg: FortiManager | None = None
         self._connected = False
+        # True once a login has succeeded at least once. Distinguishes a session
+        # that dropped after being connected (revive it) from a client that was
+        # never connected (a direct API call should still raise "Not connected").
+        self._ever_connected = False
         self._fmg_version: tuple[int, int, int] | None = None  # (major, minor, patch)
+        # Serialize forced reconnects so concurrent requests that all hit a
+        # dropped session perform a single re-login instead of racing to clear
+        # and rebuild _fmg underneath one another. The generation counter lets
+        # a waiter detect that a peer already reconnected while it blocked.
+        self._reconnect_lock = asyncio.Lock()
+        self._reconnect_generation = 0
 
         logger.info(f"Initialized FortiManager client for {self.host}")
 
@@ -154,6 +172,7 @@ class FortiManagerClient:
                 raise AuthenticationError(f"FortiManager login failed: {error_msg}")
 
             self._connected = True
+            self._ever_connected = True
             logger.info("Successfully connected to FortiManager")
 
         except AuthenticationError:
@@ -359,6 +378,76 @@ class FortiManagerClient:
         if not self._connected or not self._fmg:
             raise ConnectionError("Not connected. Call connect() first.")
         return self._fmg
+
+    async def ensure_connected(self) -> None:
+        """Reconnect once if the session has dropped.
+
+        Tools call this before issuing requests so an idle-closed session is
+        transparently revived rather than surfacing a raw "Not connected" error.
+        FortiManager can report the session gone after a streamable-HTTP session
+        closes; a fresh request should re-login rather than fail. Raises
+        ConnectionError if the single reconnect attempt fails.
+        """
+        if self.is_connected:
+            return
+        logger.warning("FortiManager session not connected; reconnecting once")
+        await self.connect()
+
+    def _is_transient_error(self, exc: Exception) -> bool:
+        """Classify whether an error is worth a bounded transient retry.
+
+        Network errors and a small set of FortiManager codes are transient:
+        ``-1`` internal error, ``-11`` task timeout. Validation, permission,
+        not-found, ADOM-locked, and authentication errors are NOT retried —
+        the auth ones are owned by :meth:`_is_session_error` (reconnect path).
+        """
+        if isinstance(exc, OSError):
+            return True
+        return getattr(exc, "code", None) in self._TRANSIENT_ERROR_CODES
+
+    def _is_session_error(self, exc: Exception) -> bool:
+        """Classify whether an error means the server session is gone.
+
+        A stale/expired session (e.g. the appliance closed an idle session)
+        surfaces as an auth error while the local client still believes it is
+        connected. A raw ``ConnectionError("Not connected. ...")`` from
+        :meth:`_ensure_connected` means the local client lost its session
+        mid-request (e.g. another path disconnected it). Both are recoverable by
+        re-logging in once.
+        """
+        if isinstance(exc, AuthenticationError):
+            return True
+        # A local not-connected error means the session dropped mid-request --
+        # but only revive it if we were genuinely connected before. A client
+        # that never connected must still surface "Not connected" rather than
+        # silently attempting a first login on an arbitrary API call.
+        if (
+            self._ever_connected
+            and isinstance(exc, ConnectionError)
+            and "not connected" in str(exc).lower()
+        ):
+            return True
+        return getattr(exc, "code", None) in self._RECONNECTABLE_ERROR_CODES
+
+    async def _force_reconnect(self) -> None:
+        """Drop stale connection state and reconnect (re-login), serialized.
+
+        The lock ensures that when several concurrent requests all hit a dropped
+        session, only the first re-logs in; the others observe the bumped
+        generation counter and return without tearing the revived connection
+        back down. A stale session still reports ``is_connected`` locally, so
+        the generation counter — not ``is_connected`` — is what detects a
+        peer's reconnect.
+        """
+        observed = self._reconnect_generation
+        async with self._reconnect_lock:
+            if self._reconnect_generation != observed:
+                # A concurrent caller already reconnected while we waited.
+                return
+            self._connected = False
+            self._fmg = None
+            await self.connect()
+            self._reconnect_generation += 1
 
     def _handle_response(self, code: int, response: Any, operation: str = "operation") -> Any:
         """Handle pyfmg response and raise appropriate exceptions."""

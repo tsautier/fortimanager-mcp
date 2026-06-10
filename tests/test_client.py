@@ -132,6 +132,146 @@ class TestVerifySSLWarning:
         )
 
 
+class TestEnsureConnectedReconnectOnce:
+    """`ensure_connected()` is the async revive-on-idle entry point tools call
+    before issuing requests. Reconnect is serialized via `_force_reconnect()`
+    so concurrent dropped-session callers don't race.
+    """
+
+    @pytest.mark.asyncio
+    async def test_ensure_connected_noop_when_connected(
+        self, mock_client: FortiManagerClient
+    ) -> None:
+        """When already connected, ensure_connected() returns without action."""
+        assert mock_client.is_connected
+        gen_before = mock_client._reconnect_generation
+        await mock_client.ensure_connected()
+        assert mock_client.is_connected
+        assert mock_client._reconnect_generation == gen_before
+
+    @pytest.mark.asyncio
+    async def test_ensure_connected_reconnects_when_disconnected(
+        self,
+        mock_client_disconnected: FortiManagerClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When the session has dropped, ensure_connected() calls connect()."""
+        calls = []
+
+        async def fake_connect(self_: FortiManagerClient) -> None:
+            calls.append("connect")
+            self_._connected = True
+            self_._fmg = MagicMock()
+            self_._ever_connected = True
+
+        monkeypatch.setattr(FortiManagerClient, "connect", fake_connect)
+        assert not mock_client_disconnected.is_connected
+        await mock_client_disconnected.ensure_connected()
+        assert mock_client_disconnected.is_connected
+        assert calls == ["connect"]
+
+    def test_is_transient_error_oserror(self, mock_client: FortiManagerClient) -> None:
+        """OSError (network problems) is transient."""
+        assert mock_client._is_transient_error(OSError("connection reset")) is True
+
+    def test_is_transient_error_known_codes(self, mock_client: FortiManagerClient) -> None:
+        """FMG codes -1 (internal) and -11 (task timeout) are transient."""
+
+        class _CodedExc(Exception):
+            def __init__(self, code: int) -> None:
+                super().__init__("err")
+                self.code = code
+
+        assert mock_client._is_transient_error(_CodedExc(-1)) is True
+        assert mock_client._is_transient_error(_CodedExc(-11)) is True
+        # -3 (permission), -4 (not found), -5 (validation) are NOT transient.
+        assert mock_client._is_transient_error(_CodedExc(-3)) is False
+        assert mock_client._is_transient_error(_CodedExc(-4)) is False
+        assert mock_client._is_transient_error(_CodedExc(-5)) is False
+
+    def test_is_session_error_auth(self, mock_client: FortiManagerClient) -> None:
+        """AuthenticationError always indicates a dropped session."""
+        from fortimanager_mcp.utils.errors import AuthenticationError
+
+        assert mock_client._is_session_error(AuthenticationError("stale")) is True
+
+    def test_is_session_error_not_connected_after_ever_connected(
+        self, mock_client: FortiManagerClient
+    ) -> None:
+        """Raw ConnectionError("Not connected. ...") after a successful initial
+        login means the local session was torn down mid-request -- recoverable.
+        """
+        from fortimanager_mcp.utils.errors import ConnectionError as FMGConnError
+
+        mock_client._ever_connected = True
+        assert (
+            mock_client._is_session_error(FMGConnError("Not connected. Call connect() first."))
+            is True
+        )
+
+    def test_is_session_error_not_connected_when_never_connected(
+        self, mock_client_disconnected: FortiManagerClient
+    ) -> None:
+        """Same not-connected error from a NEVER-connected client must surface
+        as-is, not silently trigger a first-time login on an arbitrary API call.
+        """
+        from fortimanager_mcp.utils.errors import ConnectionError as FMGConnError
+
+        mock_client_disconnected._ever_connected = False
+        assert (
+            mock_client_disconnected._is_session_error(
+                FMGConnError("Not connected. Call connect() first.")
+            )
+            is False
+        )
+
+    def test_is_session_error_reconnectable_codes(self, mock_client: FortiManagerClient) -> None:
+        """FMG codes -2 (invalid session), -20 (invalid credentials),
+        -21 (token expired) all mean session must be revived.
+        """
+
+        class _CodedExc(Exception):
+            def __init__(self, code: int) -> None:
+                super().__init__("err")
+                self.code = code
+
+        assert mock_client._is_session_error(_CodedExc(-2)) is True
+        assert mock_client._is_session_error(_CodedExc(-20)) is True
+        assert mock_client._is_session_error(_CodedExc(-21)) is True
+        # Other coded errors are NOT session errors.
+        assert mock_client._is_session_error(_CodedExc(-3)) is False
+        assert mock_client._is_session_error(_CodedExc(-11)) is False
+
+    @pytest.mark.asyncio
+    async def test_force_reconnect_serializes_concurrent_callers(
+        self,
+        mock_client_disconnected: FortiManagerClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Two concurrent _force_reconnect() callers result in EXACTLY ONE
+        connect() -- the second observes the bumped generation and bails out.
+        """
+        import asyncio
+
+        calls: list[str] = []
+
+        async def fake_connect(self_: FortiManagerClient) -> None:
+            calls.append("connect")
+            await asyncio.sleep(0)
+            self_._connected = True
+            self_._fmg = MagicMock()
+            self_._ever_connected = True
+
+        monkeypatch.setattr(FortiManagerClient, "connect", fake_connect)
+        gen_before = mock_client_disconnected._reconnect_generation
+        await asyncio.gather(
+            mock_client_disconnected._force_reconnect(),
+            mock_client_disconnected._force_reconnect(),
+        )
+        assert calls == ["connect"]
+        assert mock_client_disconnected._reconnect_generation == gen_before + 1
+
+
 class TestClientOperations:
     """Test client API operations."""
 
