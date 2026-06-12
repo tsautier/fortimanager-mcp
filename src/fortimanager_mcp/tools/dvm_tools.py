@@ -386,11 +386,17 @@ async def add_model_device(
         name = validate_device_name(name)
         client = _get_client()
 
+        # FMG expects the major version in os_ver ("7.0") and the minor in a
+        # separate mr field; passing "7.6" as os_ver fails with "Unsupported
+        # device/ADOM version" (verified live against FMG 7.6.7). Split a
+        # caller-friendly "7.6" into os_ver="7.0" + mr=6.
+        major, _, minor = os_version.partition(".")
         device_config: dict[str, Any] = {
             "name": name,
             "sn": serial_number,
             "platform_str": platform,
-            "os_ver": os_version,
+            "os_ver": f"{major}.0" if major.isdigit() else os_version,
+            "mr": int(minor) if minor.isdigit() else 0,
             "mgmt_mode": "fmg",
             "device action": "add_model",
         }

@@ -64,11 +64,18 @@ class FortiManagerClient:
     """
 
     # FMG error codes that mean the server session is gone (revive once).
-    # -2 invalid session / -20 invalid credentials / -21 token expired.
-    _RECONNECTABLE_ERROR_CODES = frozenset({-2, -20, -21})
+    # Verified live against FMG 7.6.7: a stale/invalid session surfaces as
+    # -11 "No permission for the resource" (the same code a genuinely
+    # unauthorized request gets, so the reconnect is attempted once and a real
+    # permission problem still surfaces right after). -2 was previously listed
+    # here, but on the FMG it actually means "Object already exists" -- a
+    # duplicate create must NOT trigger a re-login.
+    _RECONNECTABLE_ERROR_CODES = frozenset({-11})
     # FMG error codes worth a bounded transient retry.
-    # -1 internal error / -11 task timeout.
-    _TRANSIENT_ERROR_CODES = frozenset({-1, -11})
+    # -1 internal error. (-11 was previously listed as "task timeout", but it
+    # is really permission/stale-session -- retrying it without a reconnect
+    # just replays the failure; it is handled by the reconnect path above.)
+    _TRANSIENT_ERROR_CODES = frozenset({-1})
     # Bounded transient retry: at most this many retries with exponential backoff.
     _TRANSIENT_RETRIES = 2
     _TRANSIENT_BACKOFF_BASE = 0.5  # seconds; doubled each retry
@@ -272,20 +279,23 @@ class FortiManagerClient:
     # /pm/config endpoint expects integers and silently coerces unknown values
     # (including strings) to 0 (device_database). See GitHub issue #3.
     #
-    # Mapping source: FMG API doc 012_cli_script_management.rst
-    #   - device_database -> 0 (confirmed, doc line 1649)
-    #   - adom_database   -> 1 (confirmed, doc lines 1580/1603/1626)
-    #   - remote_device   -> 2 (confirmed live against FMG 7.6.6:
-    #                           create_script + get_script round-trip)
+    # Verified live against FMG 7.6.7 by EXECUTION (issue #21; a create+get
+    # round-trip cannot detect a swapped map because it is symmetric):
+    #   - target=2 script executes against a policy package (adom_database
+    #     semantics) and spawns a task; 0 and 1 are rejected with -8.
+    #   - target=1 script accepts a device-scoped execute (remote_device).
+    # The previous map had adom_database=1 / remote_device=2 (from the doc
+    # round-trip), which made every execute_script_on_package call fail with
+    # -8 "Invalid parameter".
     _SCRIPT_TARGET_MAP: dict[str, int] = {
         "device_database": 0,
-        "adom_database": 1,
-        "remote_device": 2,
+        "remote_device": 1,
+        "adom_database": 2,
     }
     _SCRIPT_TARGET_REVERSE: dict[int, str] = {
         0: "device_database",
-        1: "adom_database",
-        2: "remote_device",
+        1: "remote_device",
+        2: "adom_database",
     }
 
     def _map_script_target(self, script: dict[str, Any]) -> dict[str, Any]:
@@ -400,10 +410,10 @@ class FortiManagerClient:
     def _is_transient_error(self, exc: Exception) -> bool:
         """Classify whether an error is worth a bounded transient retry.
 
-        Network errors and a small set of FortiManager codes are transient:
-        ``-1`` internal error, ``-11`` task timeout. Validation, permission,
-        not-found, ADOM-locked, and authentication errors are NOT retried —
-        the auth ones are owned by :meth:`_is_session_error` (reconnect path).
+        Network errors and ``-1`` internal error are transient. Validation,
+        permission, not-found, ADOM-locked, and authentication errors are NOT
+        retried — stale-session ``-11`` is owned by :meth:`_is_session_error`
+        (reconnect path), where a retry without a fresh login would be useless.
         """
         if isinstance(exc, OSError):
             return True

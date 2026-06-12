@@ -5,6 +5,15 @@ All notable changes to FortiManager MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.1] - 2026-06-12
+
+Three bugs found and fixed by live verification against a lab FortiManager 7.6.7 (v7.6.7-build3737). 388 unit tests pass.
+
+### Fixed
+- **Script target enum was swapped on the FMG 7.6+ endpoint** — every `execute_script_on_package` call failed with `-8 Invalid parameter`. `_SCRIPT_TARGET_MAP` had `adom_database=1 / remote_device=2`; verified by execution (a create+get round-trip cannot detect a swap because the mapping is symmetric): a `target=2` script executes against a policy package and spawns a task, a `target=1` script accepts a device-scoped execute. Correct map: `device_database=0, remote_device=1, adom_database=2`. Scripts created through the MCP with `target="adom_database"` were actually stored as remote-device scripts and vice versa.
+- **`add_model_device` omitted the `mr` field** — every model-device add failed with `Unsupported device/ADOM version`. FMG expects the major version in `os_ver` (`"7.0"`) and the minor in a separate `mr` integer. The tool now splits `os_version` "X.Y" into `os_ver="X.0"` + `mr=Y` (verified live: device lands as FortiOS 7.6).
+- **FMG error-code table corrected to live-verified semantics.** The previous table mislabeled most codes: `-2` is "Object already exists" (was: invalid session — a duplicate create triggered a spurious re-login + retry), `-3` is "Object does not exist" (was: permission denied), `-8` is "Invalid parameter" (was: ADOM locked), `-10` is "data invalid for selected URL" (was: version mismatch), and `-11` is "no permission / **stale session**" (was: task timeout, retried twice with the same dead session). Newly mapped: `-22` login fail, `-10147` no write permission, `-20055` workspace locked by another admin. Consequences: `_RECONNECTABLE_ERROR_CODES` is now `{-11}` — the reconnect-once path (#14/#16) now actually triggers on the code the FMG emits for a stale session — and `_TRANSIENT_ERROR_CODES` is `{-1}`.
+
 ## [1.4.0] - 2026-06-10
 
 Hardening pass: ports the FortiAnalyzer MCP's resilience and observability patterns (PRs [fortianalyzer-mcp#17](https://github.com/rstierli/fortianalyzer-mcp/pull/17), [#18](https://github.com/rstierli/fortianalyzer-mcp/pull/18), [#22](https://github.com/rstierli/fortianalyzer-mcp/issues/22) by Christian Dassy / [@inxbit](https://github.com/inxbit)) over to FortiManager. Tracked in #11. 424 unit tests pass.

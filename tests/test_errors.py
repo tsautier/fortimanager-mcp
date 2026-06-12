@@ -118,7 +118,7 @@ class TestErrorCodeMapping:
 
     def test_error_code_map_contains_expected_codes(self):
         """Test that ERROR_CODE_MAP has expected codes."""
-        expected_codes = [-1, -2, -3, -4, -5, -6, -7, -8, -9, -10, -11, -20, -21]
+        expected_codes = [-1, -2, -3, -4, -5, -6, -7, -8, -9, -10, -11, -22, -10147, -20055]
         for code in expected_codes:
             assert code in ERROR_CODE_MAP
 
@@ -130,19 +130,21 @@ class TestErrorCodeMapping:
     @pytest.mark.parametrize(
         "code,expected_class",
         [
+            # Codes verified live against FMG 7.6.7 (issue #21).
             (-1, APIError),
-            (-2, AuthenticationError),
-            (-3, PermissionError),
+            (-2, ObjectError),  # Object already exists
+            (-3, ResourceNotFoundError),  # Object does not exist
             (-4, ResourceNotFoundError),
-            (-5, ValidationError),
-            (-6, ObjectError),
+            (-5, APIError),  # No such command
+            (-6, ValidationError),  # Invalid URL
             (-7, ObjectError),
-            (-8, ADOMLockError),
-            (-9, ADOMLockError),
-            (-10, APIError),
-            (-11, TimeoutError),
-            (-20, AuthenticationError),
-            (-21, AuthenticationError),
+            (-8, ValidationError),  # Invalid parameter
+            (-9, ValidationError),  # Command invalid for selected URL
+            (-10, ValidationError),  # Data invalid for selected URL
+            (-11, PermissionError),  # No permission / stale session
+            (-22, AuthenticationError),  # Login fail
+            (-10147, PermissionError),  # No write permission
+            (-20055, ADOMLockError),  # Workspace locked by another admin
         ],
     )
     def test_code_to_exception_mapping(self, code, expected_class):
@@ -176,18 +178,18 @@ class TestParseFmgError:
         assert "/dvmdb/device" in str(error)
 
     def test_auth_error_code(self):
-        """Test authentication error code."""
-        error = parse_fmg_error(-20, "Invalid credentials")
+        """Test authentication error code (-22 = login fail, verified live)."""
+        error = parse_fmg_error(-22, "Login fail")
         assert isinstance(error, AuthenticationError)
 
     def test_permission_error_code(self):
-        """Test permission error code."""
-        error = parse_fmg_error(-3, "Access denied")
+        """Test permission error code (-11, verified live)."""
+        error = parse_fmg_error(-11, "No permission for the resource")
         assert isinstance(error, PermissionError)
 
     def test_lock_error_code(self):
-        """Test ADOM lock error code."""
-        error = parse_fmg_error(-8, "Workspace locked")
+        """Test ADOM lock error code (-20055, verified live)."""
+        error = parse_fmg_error(-20055, "Workspace is locked by other user")
         assert isinstance(error, ADOMLockError)
 
     def test_message_combines_base_and_detail(self):
@@ -289,7 +291,7 @@ class TestClientSafeError:
         err = parse_fmg_error(-3, "raw body /pm/config/adom/root/obj/firewall/address/x")
         msg, code = client_safe_error(err)
         assert "/pm/config" not in msg
-        assert code == "permission_denied"
+        assert code == "not_found"
 
     def test_scrubs_api_path_from_plain_exception(self):
         err = Exception("failure at /pm/config/adom/root/pkg/default/firewall/policy/5")
