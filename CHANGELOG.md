@@ -5,7 +5,7 @@ All notable changes to FortiManager MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.6.0] - 2026-06-11
+## [1.6.0] - 2026-06-12
 
 Async-task contract (bundle C of [#11](https://github.com/rstierli/fortimanager-mcp/issues/11)): anti-exhaustion guards for the FMG task lifecycle — bounded concurrent task spawns, deadline-bounded status polls, and a shared poll-recovery budget. Adapted from the FortiAnalyzer MCP's logsearch guards ([fortianalyzer-mcp#18](https://github.com/rstierli/fortianalyzer-mcp/pull/18)). 400 unit tests pass.
 
