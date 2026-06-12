@@ -217,38 +217,46 @@ class InstallError(FortiManagerMCPError):
 # FortiManager Error Code Mapping
 # =============================================================================
 
-# FortiManager API error codes and their corresponding exception classes
+# FortiManager API error codes and their corresponding exception classes.
+#
+# Codes marked [verified] were probed live against FMG 7.6.7 (issue #21);
+# the previous table was off by several codes (e.g. -2 was treated as an
+# invalid session when it actually means a duplicate object, and -3 as
+# permission-denied when it means not-found), which produced misleading
+# error envelopes and spurious reconnects.
 ERROR_CODE_MAP: dict[int, type[FortiManagerMCPError]] = {
     -1: APIError,  # Internal error
-    -2: AuthenticationError,  # Invalid session
-    -3: PermissionError,  # Permission denied
-    -4: ResourceNotFoundError,  # Object not found
-    -5: ValidationError,  # Invalid parameter
-    -6: ObjectError,  # Entry already exists (duplicate)
-    -7: ObjectError,  # Entry in use (cannot delete)
-    -8: ADOMLockError,  # Workspace locked
-    -9: ADOMLockError,  # Workspace has uncommitted changes
-    -10: APIError,  # Version mismatch
-    -11: TimeoutError,  # Task timeout
-    -20: AuthenticationError,  # Invalid credentials
-    -21: AuthenticationError,  # Token expired
+    -2: ObjectError,  # Object already exists [verified]
+    -3: ResourceNotFoundError,  # Object does not exist [verified]
+    -4: ResourceNotFoundError,  # Object not found (legacy entry, unverified)
+    -5: APIError,  # No such command [verified]
+    -6: ValidationError,  # Invalid URL [verified]
+    -7: ObjectError,  # Entry in use (legacy entry, unverified)
+    -8: ValidationError,  # Invalid parameter [verified]
+    -9: ValidationError,  # Command invalid for selected URL [verified]
+    -10: ValidationError,  # Data invalid for selected URL [verified]
+    -11: PermissionError,  # No permission / stale session [verified]
+    -22: AuthenticationError,  # Login fail [verified]
+    -10147: PermissionError,  # No write permission [verified]
+    -20055: ADOMLockError,  # Workspace locked by another admin [verified]
 }
 
 # Human-readable messages for common error codes
 ERROR_CODE_MESSAGES: dict[int, str] = {
     -1: "Internal server error occurred",
-    -2: "Session is invalid or expired",
-    -3: "Permission denied for this operation",
+    -2: "Object already exists",
+    -3: "Object does not exist",
     -4: "Requested resource not found",
-    -5: "Invalid parameter value",
-    -6: "Object already exists",
+    -5: "No such command",
+    -6: "Invalid URL",
     -7: "Cannot delete object - it is still in use",
-    -8: "ADOM is locked by another user",
-    -9: "ADOM has uncommitted changes",
-    -10: "API version mismatch",
-    -11: "Operation timed out",
-    -20: "Invalid username or password",
-    -21: "Authentication token has expired",
+    -8: "Invalid parameter",
+    -9: "The command is invalid for the selected URL",
+    -10: "The data is invalid for the selected URL",
+    -11: "No permission for the resource (or the session expired)",
+    -22: "Login failed - invalid credentials",
+    -10147: "No write permission (read-only admin, or ADOM not locked in workspace mode)",
+    -20055: "Workspace is locked by another administrator",
 }
 
 

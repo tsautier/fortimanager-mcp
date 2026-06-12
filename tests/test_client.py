@@ -10,7 +10,6 @@ from fortimanager_mcp.utils.errors import (
     APIError,
     ConnectionError,
     FortiManagerMCPError,
-    PermissionError,
     parse_fmg_error,
 )
 
@@ -175,7 +174,7 @@ class TestEnsureConnectedReconnectOnce:
         assert mock_client._is_transient_error(OSError("connection reset")) is True
 
     def test_is_transient_error_known_codes(self, mock_client: FortiManagerClient) -> None:
-        """FMG codes -1 (internal) and -11 (task timeout) are transient."""
+        """Only FMG code -1 (internal error) is transient."""
 
         class _CodedExc(Exception):
             def __init__(self, code: int) -> None:
@@ -183,11 +182,13 @@ class TestEnsureConnectedReconnectOnce:
                 self.code = code
 
         assert mock_client._is_transient_error(_CodedExc(-1)) is True
-        assert mock_client._is_transient_error(_CodedExc(-11)) is True
-        # -3 (permission), -4 (not found), -5 (validation) are NOT transient.
+        # -11 is permission/stale-session: owned by the reconnect path, not
+        # transient retry (verified live against FMG 7.6.7).
+        assert mock_client._is_transient_error(_CodedExc(-11)) is False
+        # -3 (not found), -4, -8 (invalid parameter) are NOT transient.
         assert mock_client._is_transient_error(_CodedExc(-3)) is False
         assert mock_client._is_transient_error(_CodedExc(-4)) is False
-        assert mock_client._is_transient_error(_CodedExc(-5)) is False
+        assert mock_client._is_transient_error(_CodedExc(-8)) is False
 
     def test_is_session_error_auth(self, mock_client: FortiManagerClient) -> None:
         """AuthenticationError always indicates a dropped session."""
@@ -226,8 +227,10 @@ class TestEnsureConnectedReconnectOnce:
         )
 
     def test_is_session_error_reconnectable_codes(self, mock_client: FortiManagerClient) -> None:
-        """FMG codes -2 (invalid session), -20 (invalid credentials),
-        -21 (token expired) all mean session must be revived.
+        """FMG -11 means stale session (verified live 7.6.7): revive once.
+
+        -2 means "Object already exists" — a duplicate create must NOT
+        trigger a re-login (it previously did).
         """
 
         class _CodedExc(Exception):
@@ -235,12 +238,10 @@ class TestEnsureConnectedReconnectOnce:
                 super().__init__("err")
                 self.code = code
 
-        assert mock_client._is_session_error(_CodedExc(-2)) is True
-        assert mock_client._is_session_error(_CodedExc(-20)) is True
-        assert mock_client._is_session_error(_CodedExc(-21)) is True
+        assert mock_client._is_session_error(_CodedExc(-11)) is True
         # Other coded errors are NOT session errors.
+        assert mock_client._is_session_error(_CodedExc(-2)) is False
         assert mock_client._is_session_error(_CodedExc(-3)) is False
-        assert mock_client._is_session_error(_CodedExc(-11)) is False
 
     @pytest.mark.asyncio
     async def test_force_reconnect_serializes_concurrent_callers(
@@ -506,10 +507,12 @@ class TestErrorHandling:
     """Test error handling."""
 
     def test_parse_fmg_error_known_code(self) -> None:
-        """Test parsing known error codes."""
+        """Test parsing known error codes (-3 = not found, verified live)."""
+        from fortimanager_mcp.utils.errors import ResourceNotFoundError
+
         error = parse_fmg_error(-3, "Not found", "GET /test")
-        assert isinstance(error, PermissionError)
-        assert "Permission denied" in str(error)
+        assert isinstance(error, ResourceNotFoundError)
+        assert "Object does not exist" in str(error)
 
     def test_parse_fmg_error_unknown_code(self) -> None:
         """Test parsing unknown error codes."""
@@ -529,7 +532,7 @@ class TestErrorHandling:
         with pytest.raises(FortiManagerMCPError) as exc_info:
             await mock_client.get("/test/url")
 
-        assert "Permission denied" in str(exc_info.value)
+        assert "Object does not exist" in str(exc_info.value)
 
 
 class TestScriptTargetMapping:
@@ -569,7 +572,7 @@ class TestScriptTargetMapping:
         url = call_args.args[0]
         body = call_args.kwargs["data"]
         assert url == "/pm/config/adom/root/obj/fmg/script"
-        assert body["target"] == 2, "remote_device must map to 2 on FMG 7.6+"
+        assert body["target"] == 1, "remote_device must map to 1 on FMG 7.6+"
         assert isinstance(body["target"], int)
 
     @pytest.mark.asyncio
@@ -584,8 +587,8 @@ class TestScriptTargetMapping:
 
         expected = {
             "device_database": 0,
-            "adom_database": 1,
-            "remote_device": 2,
+            "remote_device": 1,
+            "adom_database": 2,
         }
 
         for target_str, target_int in expected.items():
@@ -700,7 +703,7 @@ class TestScriptTargetMapping:
         url = call_args.args[0]
         body = call_args.kwargs["data"]
         assert url == "/pm/config/adom/root/obj/fmg/script/existing"
-        assert body["target"] == 1
+        assert body["target"] == 2
         assert body["desc"] == "updated"
 
     @pytest.mark.asyncio
@@ -743,8 +746,8 @@ class TestScriptTargetMapping:
         targets = {s["name"]: s["target"] for s in scripts}
         assert targets == {
             "s1": "device_database",
-            "s2": "adom_database",
-            "s3": "remote_device",
+            "s2": "remote_device",
+            "s3": "adom_database",
         }
 
     @pytest.mark.asyncio
@@ -774,7 +777,7 @@ class TestScriptTargetMapping:
         mock_fmg_instance.get.return_value = (0, {"name": "s1", "target": 2})
 
         script = await mock_client.get_script(adom="root", name="s1")
-        assert script["target"] == "remote_device"
+        assert script["target"] == "adom_database"
 
     def test_uses_new_script_endpoint_predicate(self) -> None:
         """The version predicate matches the script endpoint branch exactly."""
@@ -804,7 +807,7 @@ class TestScriptTargetMapping:
         mock_client._fmg_version = (7, 6, 5)
         mock_fmg_instance.get.return_value = (0, [])
 
-        expected = {"device_database": 0, "adom_database": 1, "remote_device": 2}
+        expected = {"device_database": 0, "remote_device": 1, "adom_database": 2}
         for target_str, target_int in expected.items():
             mock_fmg_instance.get.reset_mock()
             await mock_client.list_scripts(
@@ -856,7 +859,7 @@ class TestScriptTargetMapping:
         params = mock_fmg_instance.get.call_args.kwargs
         assert params["filter"] == [
             ["type", "==", "cli"],
-            ["target", "==", 2],
+            ["target", "==", 1],
         ]
 
     @pytest.mark.asyncio
@@ -893,7 +896,7 @@ class TestScriptTargetMapping:
         )
 
         params = mock_fmg_instance.get.call_args.kwargs
-        assert params["filter"] == [["target", "!=", 2]]
+        assert params["filter"] == [["target", "!=", 1]]
 
     @pytest.mark.asyncio
     async def test_list_scripts_target_filter_int_value_unchanged(
@@ -944,7 +947,7 @@ class TestScriptTargetMapping:
         )
 
         params = mock_fmg_instance.get.call_args.kwargs
-        assert params["filter"] == [["target", "in", 0, 2]]
+        assert params["filter"] == [["target", "in", 0, 1]]
 
     @pytest.mark.asyncio
     async def test_list_scripts_target_filter_not_in_operator_mapped(
@@ -962,7 +965,7 @@ class TestScriptTargetMapping:
         )
 
         params = mock_fmg_instance.get.call_args.kwargs
-        assert params["filter"] == [["target", "!in", 2, 1]]
+        assert params["filter"] == [["target", "!in", 1, 2]]
 
     @pytest.mark.asyncio
     async def test_list_scripts_target_filter_in_operator_mixed_values(
@@ -1021,7 +1024,7 @@ class TestScriptTargetMapping:
         params = mock_fmg_instance.get.call_args.kwargs
         assert params["filter"] == [
             ["type", "==", "cli"],
-            ["target", "in", 2, 1],
+            ["target", "in", 1, 2],
         ]
 
     @pytest.mark.asyncio
